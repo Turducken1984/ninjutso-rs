@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Verify the udev rule granted this user access to the Ninjutso config interface.
+# Pure shell -- deliberately has no build step, so it works before cargo does.
+vendor=093a
+
+node=""
+for sys in /sys/class/hidraw/hidraw*; do
+  [ -e "$sys/device/uevent" ] || continue
+  grep -qi "^HID_ID=.*:0*${vendor}:" "$sys/device/uevent" || continue
+  # The config channel is the collection declaring report 6; the other
+  # interfaces of the same receiver do not answer config commands.
+  if grep -qa $'\x06\x01\xff\x09\x01\xa1\x01\x85\x06' "$sys/device/report_descriptor" 2>/dev/null; then
+    node="/dev/$(basename "$sys")"
+    break
+  fi
+done
+
+if [ -z "$node" ]; then
+  echo "✗ no Ninjutso config interface found — is the receiver plugged in?"; exit 1
+fi
+echo "device:  $node"
+echo "perms:   $(stat -c '%U:%G %a' "$node")"
+if getfacl -- "$node" 2>/dev/null | grep -q "^user:$USER:.*r"; then
+  echo "acl:     user:$USER granted ✓"
+else
+  echo "acl:     no entry for $USER ✗"
+fi
+if [ -r "$node" ] && [ -w "$node" ]; then
+  echo "access:  readable and writable ✓"
+  echo
+  echo "Ready — run: cargo run --bin ninjutso-cli -- status"
+else
+  echo "access:  DENIED ✗"
+  echo
+  echo "Install 70-ninjutso.rules (see the README), then replug the receiver."
+fi

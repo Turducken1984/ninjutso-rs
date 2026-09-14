@@ -1,0 +1,4 @@
+/target
+
+# Vendor firmware installers are proprietary and must not be redistributed.
+*.exe

@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# Add (or remove) the Ninjutso GUI from your application grid. No root needed.
+# Expects `cargo build --release` to have run first.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+id="co.ninjutso.Configurator"
+bin="$here/target/release"
+apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+autostart="${XDG_CONFIG_HOME:-$HOME/.config}/autostart"
+
+if [ "${1:-}" = "--uninstall" ]; then
+  rm -fv "$apps/$id.desktop" "$icons/$id.svg" "$autostart/$id.Tray.desktop"
+elif [ "${1:-}" = "--autostart" ]; then
+  [ -x "$bin/ninjutso-tray" ] || { echo "build first: cargo build --release" >&2; exit 1; }
+  mkdir -p "$autostart"
+  cat > "$autostart/$id.Tray.desktop" <<TRAY
+[Desktop Entry]
+Type=Application
+Name=Ninjutso Battery Tray
+Comment=Shows Ninjutso mouse battery level in the system tray
+Exec=$bin/ninjutso-tray --poll ${2:-10}
+Icon=$id
+Terminal=false
+X-GNOME-Autostart-enabled=true
+TRAY
+  chmod 644 "$autostart/$id.Tray.desktop"
+  echo "autostart enabled: $autostart/$id.Tray.desktop (poll every ${2:-10} min)"
+  exit 0
+elif [ "${1:-}" = "--no-autostart" ]; then
+  rm -fv "$autostart/$id.Tray.desktop"; exit 0
+else
+  [ -x "$bin/ninjutso-gui" ] || { echo "build first: cargo build --release" >&2; exit 1; }
+  mkdir -p "$apps" "$icons"
+  install -m644 "$here/$id.svg" "$icons/$id.svg"
+  cat > "$apps/$id.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=Ninjutso
+GenericName=Mouse Configuration
+Comment=Configure DPI, report rate and lighting on Ninjutso mice
+Exec=$bin/ninjutso-gui
+Icon=$id
+Terminal=false
+Categories=Settings;HardwareSettings;GTK;
+Keywords=mouse;dpi;polling;gaming;ninjutso;sensor;
+StartupNotify=true
+StartupWMClass=$id
+DESKTOP
+  chmod 644 "$apps/$id.desktop"
+  echo "installed: $apps/$id.desktop"
+  echo "installed: $icons/$id.svg"
+fi
+
+command -v update-desktop-database >/dev/null && update-desktop-database "$apps" || true
+command -v gtk-update-icon-cache >/dev/null && \
+  gtk-update-icon-cache -qtf "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
+echo "done."

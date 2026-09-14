@@ -1,0 +1,53 @@
+[package]
+name = "ninjutso"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+license = "GPL-3.0-or-later"
+description = "Configure Ninjutso mice on Linux"
+repository = "https://github.com/Turducken1984/ninjutso-rs"
+readme = "README.md"
+categories = ["command-line-utilities", "hardware-support"]
+keywords = ["mouse", "hid", "hidraw", "ninjutso", "dpi"]
+
+[features]
+# The CLI is the only thing that builds with no system dev packages at all.
+# `gui` needs gtk4-devel + libadwaita-devel; `tray` is pure Rust over D-Bus.
+default = ["gui", "tray"]
+gui = ["dep:gtk4", "dep:libadwaita", "dep:async-channel"]
+tray = ["dep:zbus"]
+
+[dependencies]
+libc = "0.2"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+gtk4 = { version = "0.9", optional = true }
+libadwaita = { version = "0.7", features = ["v1_5"], optional = true }
+async-channel = { version = "2", optional = true }
+zbus = { version = "5", optional = true }
+
+[lib]
+name = "ninjutso"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ninjutso-cli"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "ninjutso-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]
+
+[[bin]]
+name = "ninjutso-tray"
+path = "src/bin/tray.rs"
+required-features = ["tray"]
+
+[profile.release]
+lto = true
+strip = true

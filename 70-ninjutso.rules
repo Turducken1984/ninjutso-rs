@@ -1,0 +1,8 @@
+# Ninjutso HID access for NinjaForce (WebHID) and native tools
+# Ten / TEN AIR receiver + mouse, Sora V2/V3 — Pixart-assigned VID 093a
+#
+# Must sort before 73-seat-late.rules, which is what turns TAG+="uaccess"
+# into an ACL (RUN{builtin}+="uaccess"). Numbered 99- the tag is set too
+# late for that rule to see it: MODE still applies, but no ACL is granted.
+KERNEL=="hidraw*", ATTRS{idVendor}=="093a", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="093a", MODE="0660", TAG+="uaccess"
