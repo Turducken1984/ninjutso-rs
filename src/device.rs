@@ -262,9 +262,29 @@ impl Device {
                 return Ok(value);
             }
             if Instant::now() >= deadline {
-                return Err(Error::Timeout(command));
+                return Err(self.link_failure(command));
             }
             delay = RETRY_READ_DELAY;
+        }
+    }
+
+    /// Why a required read timed out: a sleeping mouse, or the command itself.
+    ///
+    /// The receiver keeps answering its own commands while the mouse is off the
+    /// air, so a timeout on anything needing the mouse is usually sleep rather
+    /// than a protocol fault -- `sleep_minutes` defaults to 2 on the Ten.
+    /// Reporting that as `device did not answer command 0x10` sends people
+    /// looking for a bug in the software.
+    ///
+    /// Probes once, and never for `ONLINE` itself, so a receiver that has truly
+    /// stopped answering cannot recurse.
+    fn link_failure(&self, command: u8) -> Error {
+        if command == cmd::ONLINE || !self.is_receiver() {
+            return Error::Timeout(command);
+        }
+        match self.attempt(cmd::ONLINE, &[], FIRST_READ_DELAY) {
+            Ok(Some(value)) if value[0] == 0 => Error::Offline,
+            _ => Error::Timeout(command),
         }
     }
 

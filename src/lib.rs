@@ -29,6 +29,10 @@ pub enum Error {
     #[error("device did not answer command 0x{0:02x}")]
     Timeout(u8),
 
+    /// The receiver is answering, but the mouse is not on the air.
+    #[error("mouse is not connected to the receiver -- move or click it to wake it")]
+    Offline,
+
     /// The connected hardware does not implement this command.
     #[error("{0}")]
     Unsupported(String),
@@ -45,6 +49,12 @@ impl Error {
     /// the udev rule), which the front ends report differently from a bug.
     pub fn is_access_problem(&self) -> bool {
         matches!(self, Error::DeviceNotFound | Error::PermissionDenied { .. })
+    }
+
+    /// True when the receiver is fine and only the mouse is asleep, which the
+    /// user fixes by touching the mouse rather than by touching the software.
+    pub fn is_offline(&self) -> bool {
+        matches!(self, Error::Offline)
     }
 }
 
