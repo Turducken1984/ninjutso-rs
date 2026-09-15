@@ -5,10 +5,26 @@ use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::protocol::{self as p, cmd};
 use crate::{Error, Result};
+
+const FIRST_READ_DELAY: Duration = Duration::from_millis(30);
+const RETRY_READ_DELAY: Duration = Duration::from_millis(60);
+
+/// How long a required read keeps asking before giving up.
+///
+/// Measured on a Ten: after a polling-rate write the device needs five attempts
+/// (~270 ms) to answer, because changing the report rate renegotiates the 2.4 GHz
+/// link; after a lighting write it needs three; every other read answers on the
+/// first. The old fixed budget of four attempts could therefore never confirm a
+/// rate change, and the setter reported failure on a write that had landed.
+///
+/// A duration rather than a count, so a slower link or another model does not need
+/// the number re-tuned. It only bounds failure: a read that succeeds returns as
+/// soon as the device answers.
+const READ_BUDGET: Duration = Duration::from_millis(750);
 
 // _IOC(dir = READ|WRITE, type = 'H', nr, size)
 const IOC_RW: u32 = 3;
@@ -238,27 +254,41 @@ impl Device {
     /// The device answers asynchronously and will hand back a stale reply if
     /// asked too soon, so each attempt re-sends and re-reads until the reply's
     /// command byte matches.
-    pub fn read(&self, command: u8, args: &[u8], attempts: u32) -> Result<Vec<u8>> {
+    pub fn read(&self, command: u8, args: &[u8]) -> Result<Vec<u8>> {
+        let deadline = Instant::now() + READ_BUDGET;
+        let mut delay = FIRST_READ_DELAY;
+        loop {
+            if let Some(value) = self.attempt(command, args, delay)? {
+                return Ok(value);
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout(command));
+            }
+            delay = RETRY_READ_DELAY;
+        }
+    }
+
+    /// One request/response round trip; `None` when the reply is not ours.
+    fn attempt(&self, command: u8, args: &[u8], delay: Duration) -> Result<Option<Vec<u8>>> {
         let profile = if p::is_profile_command(command) {
             self.profile
         } else {
             0
         };
         let request = p::build_request(command, profile, args)?;
-        for attempt in 0..attempts {
-            self.set_feature(p::REPORT_ID, &request)?;
-            sleep(Duration::from_millis(if attempt == 0 { 30 } else { 60 }));
-            let buf = self.get_feature(p::REPORT_ID, p::PAYLOAD_LEN)?;
-            if let Some(value) = p::response_value(&buf, command) {
-                return Ok(value.to_vec());
-            }
-        }
-        Err(Error::Timeout(command))
+        self.set_feature(p::REPORT_ID, &request)?;
+        sleep(delay);
+        let buf = self.get_feature(p::REPORT_ID, p::PAYLOAD_LEN)?;
+        Ok(p::response_value(&buf, command).map(<[u8]>::to_vec))
     }
 
     /// Read a command the device may not implement; `None` if unsupported.
+    ///
+    /// Exactly one attempt: an unanswered read is precisely how an unimplemented
+    /// command presents, so retrying only slows detection. Never use this to
+    /// confirm a write -- see [`READ_BUDGET`].
     pub fn read_optional(&self, command: u8, args: &[u8]) -> Option<Vec<u8>> {
-        self.read(command, args, 1).ok()
+        self.attempt(command, args, FIRST_READ_DELAY).ok().flatten()
     }
 
     pub fn write(&self, command: u8, args: &[u8]) -> Result<()> {
@@ -284,7 +314,7 @@ impl Device {
             return Ok(pid);
         }
         let pid = if self.is_receiver() {
-            let value = self.read(cmd::PAIRED_PRODUCT_ID, &[], 4)?;
+            let value = self.read(cmd::PAIRED_PRODUCT_ID, &[])?;
             ((value[1] as u16) << 8) | value[0] as u16
         } else {
             self.product_id
@@ -299,13 +329,13 @@ impl Device {
     }
 
     pub fn status(&mut self) -> Result<Status> {
-        self.profile = match self.read(cmd::PROFILE, &[], 4)?[0] {
+        self.profile = match self.read(cmd::PROFILE, &[])?[0] {
             0 => 1,
             value => value,
         };
         let direct = self.direct()?;
-        let stage = self.read(cmd::ACTIVE_DPI_STAGE, &[], 4)?[0] as usize;
-        let dpi_now = self.read(cmd::DPI, &[stage as u8], 4)?;
+        let stage = self.read(cmd::ACTIVE_DPI_STAGE, &[])?[0] as usize;
+        let dpi_now = self.read(cmd::DPI, &[stage as u8])?;
         let stage_count = self
             .read_optional(cmd::DPI_STAGE_COUNT, &[])
             .map_or(1, |value| value[0] as usize)
@@ -357,7 +387,7 @@ impl Device {
             dpi_stage: stage,
             dpi: stages.get(stage).copied(),
             dpi_stages: stages,
-            polling_rate: p::decode_polling(self.read(cmd::POLLING_RATE, &[], 4)?[0]),
+            polling_rate: p::decode_polling(self.read(cmd::POLLING_RATE, &[])?[0]),
             lift_off: lod
                 .as_ref()
                 .and_then(|value| p::LOD_VALUES.get(value[0] as usize).copied()),
@@ -433,21 +463,21 @@ impl Device {
     pub fn set_dpi(&mut self, dpi: u32, stage: Option<usize>) -> Result<f64> {
         let stage = match stage {
             Some(stage) => stage,
-            None => self.read(cmd::ACTIVE_DPI_STAGE, &[], 4)?[0] as usize,
+            None => self.read(cmd::ACTIVE_DPI_STAGE, &[])?[0] as usize,
         };
         let direct = self.direct()?;
         let mut args = vec![stage as u8];
         args.extend_from_slice(&p::encode_dpi(dpi, direct)?);
         self.write(cmd::SET_DPI, &args)?;
         sleep(Duration::from_millis(30));
-        let value = self.read(cmd::DPI, &[stage as u8], 4)?;
+        let value = self.read(cmd::DPI, &[stage as u8])?;
         Ok(p::decode_dpi(value[0], value[1], value[2], direct))
     }
 
     pub fn set_polling_rate(&mut self, rate: u32) -> Result<u32> {
         self.write(cmd::SET_POLLING_RATE, &[p::encode_polling(rate)?])?;
         sleep(Duration::from_millis(30));
-        Ok(p::decode_polling(self.read(cmd::POLLING_RATE, &[], 4)?[0]))
+        Ok(p::decode_polling(self.read(cmd::POLLING_RATE, &[])?[0]))
     }
 
     pub fn set_lift_off(&mut self, value: &str) -> Result<&'static str> {
@@ -457,7 +487,7 @@ impl Device {
             .ok_or_else(|| Error::Protocol(format!("unknown lift-off distance {value}")))?;
         self.write(cmd::SET_LIFT_OFF, &[index as u8])?;
         sleep(Duration::from_millis(30));
-        let read_back = self.read(cmd::LIFT_OFF, &[], 4)?[0] as usize;
+        let read_back = self.read(cmd::LIFT_OFF, &[])?[0] as usize;
         p::LOD_VALUES
             .get(read_back)
             .copied()
@@ -467,7 +497,7 @@ impl Device {
     pub fn set_motion_sync(&mut self, enabled: bool) -> Result<bool> {
         self.write(cmd::SET_MOTION_SYNC, &[enabled as u8])?;
         sleep(Duration::from_millis(30));
-        Ok(self.read(cmd::MOTION_SYNC, &[], 4)?[0] != 0)
+        Ok(self.read(cmd::MOTION_SYNC, &[])?[0] != 0)
     }
 
     /// Verified on hardware: the TEN receiver does not answer command 48.
@@ -483,7 +513,7 @@ impl Device {
     /// after a lighting write, so a single attempt reports every successful
     /// write as unconfirmed.
     fn confirmed(&self, command: u8) -> Result<Vec<u8>> {
-        self.read(command, &[], 4)
+        self.read(command, &[])
     }
 
     fn confirmed_light_mode(&self) -> Result<&'static str> {
