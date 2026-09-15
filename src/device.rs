@@ -475,7 +475,31 @@ impl Device {
         self.direct()
     }
 
-    pub fn set_brightness(&mut self, percent: u8) -> Result<Option<u8>> {
+    /// Read back a value after a write, retrying like any required read.
+    ///
+    /// [`Device::read_optional`] makes a single attempt because it exists to
+    /// detect commands the hardware does not implement, where one unanswered
+    /// read is the answer. The receiver needs about three round trips to reply
+    /// after a lighting write, so a single attempt reports every successful
+    /// write as unconfirmed.
+    fn confirmed(&self, command: u8) -> Result<Vec<u8>> {
+        self.read(command, &[], 4)
+    }
+
+    fn confirmed_light_mode(&self) -> Result<&'static str> {
+        if self.confirmed(cmd::LIGHTING_STATE)?[0] == 0 {
+            return Ok("Off");
+        }
+        const MODE_MAP: [&str; 4] = ["", "Static", "Cycling", "Wave"];
+        let mode = self.confirmed(cmd::LIGHTING_MODE)?;
+        Ok(MODE_MAP
+            .get(mode[0] as usize)
+            .copied()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Static"))
+    }
+
+    pub fn set_brightness(&mut self, percent: u8) -> Result<u8> {
         if !self.supports_brightness()? {
             return Err(Error::Unsupported(
                 "This receiver has no brightness control -- the TEN answers \
@@ -485,12 +509,10 @@ impl Device {
         }
         self.write(cmd::SET_LIGHTING_BRIGHTNESS, &[percent / 25])?;
         sleep(Duration::from_millis(30));
-        Ok(self
-            .read_optional(cmd::LIGHTING_BRIGHTNESS, &[])
-            .map(|value| value[0].saturating_mul(25)))
+        Ok(self.confirmed(cmd::LIGHTING_BRIGHTNESS)?[0].saturating_mul(25))
     }
 
-    pub fn set_light_mode(&mut self, mode: &str) -> Result<Option<&'static str>> {
+    pub fn set_light_mode(&mut self, mode: &str) -> Result<&'static str> {
         if mode == "Off" {
             self.write(cmd::SET_LIGHTING_STATE, &[0])?;
         } else {
@@ -502,13 +524,14 @@ impl Device {
             self.write(cmd::SET_LIGHTING_MODE, &[index as u8 + 1])?;
         }
         sleep(Duration::from_millis(30));
-        Ok(self.read_lighting()?.map(|light| light.mode))
+        self.confirmed_light_mode()
     }
 
-    pub fn set_color(&mut self, hex_colour: &str) -> Result<Option<String>> {
+    pub fn set_color(&mut self, hex_colour: &str) -> Result<String> {
         self.write(cmd::SET_LIGHTING_COLOR, &p::hex_to_rgb(hex_colour)?)?;
         sleep(Duration::from_millis(30));
-        Ok(self.read_lighting()?.and_then(|light| light.color))
+        let value = self.confirmed(cmd::LIGHTING_COLOR)?;
+        Ok(p::rgb_to_hex(value[0], value[1], value[2]))
     }
 }
 

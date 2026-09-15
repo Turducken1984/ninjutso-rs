@@ -109,10 +109,10 @@ fn spawn_worker(commands: mpsc::Receiver<Command>, replies: async_channel::Sende
                         .map(|on| if on { "on" } else { "off" }),
                 ),
                 Command::SetLightMode(mode) => {
-                    confirm_optional("Light mode", device.set_light_mode(&mode))
+                    confirm("Light mode", device.set_light_mode(&mode))
                 }
                 Command::SetBrightness(value) => {
-                    confirm_optional("Brightness", device.set_brightness(value))
+                    confirm("Brightness", device.set_brightness(value))
                 }
             };
             if replies.send_blocking(reply).is_err() {
@@ -125,14 +125,6 @@ fn spawn_worker(commands: mpsc::Receiver<Command>, replies: async_channel::Sende
 fn confirm<T: std::fmt::Display>(label: &str, result: Result<T, Error>) -> Reply {
     match result {
         Ok(value) => Reply::Toast(format!("{label} → {value}")),
-        Err(err) => Reply::Toast(format!("{label} failed: {err}")),
-    }
-}
-
-fn confirm_optional<T: std::fmt::Display>(label: &str, result: Result<Option<T>, Error>) -> Reply {
-    match result {
-        Ok(Some(value)) => Reply::Toast(format!("{label} → {value}")),
-        Ok(None) => Reply::Toast(format!("{label}: device did not confirm")),
         Err(err) => Reply::Toast(format!("{label} failed: {err}")),
     }
 }

@@ -194,14 +194,14 @@ fn cmd_light(device: &mut Device, args: &LightArgs) -> Result<u8, Error> {
     let mut rc = 0;
     if let Some(mode) = &args.mode {
         let before = light.as_ref().map_or("—", |l| l.mode);
-        rc |= report("Light mode", before, device.set_light_mode(mode)?, "");
+        rc |= report("Light mode", before, Some(device.set_light_mode(mode)?), "");
     }
     if let Some(color) = &args.color {
         let before = light
             .as_ref()
             .and_then(|l| l.color.clone())
             .unwrap_or_else(|| "—".to_string());
-        rc |= report("Colour", before, device.set_color(color)?, "");
+        rc |= report("Colour", before, Some(device.set_color(color)?), "");
     }
     if let Some(brightness) = args.brightness {
         let before = light
@@ -209,7 +209,7 @@ fn cmd_light(device: &mut Device, args: &LightArgs) -> Result<u8, Error> {
             .and_then(|l| l.brightness)
             .map_or_else(|| "—".to_string(), |b| b.to_string());
         match device.set_brightness(brightness) {
-            Ok(after) => rc |= report("Brightness", before, after, "%"),
+            Ok(after) => rc |= report("Brightness", before, Some(after), "%"),
             Err(err @ Error::Unsupported(_)) => {
                 println!("  {err}");
                 rc = 1;
