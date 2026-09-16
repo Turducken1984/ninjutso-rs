@@ -29,7 +29,6 @@ const CSS: &str = concat!(
     "}\n",
     ".battery-good { color: #36ad6a; font-weight: 700; }\n",
     ".battery-low  { color: #e10600; font-weight: 700; }\n",
-    ".fw-footer    { font-size: 0.85em; opacity: 0.6; }\n",
     ".dot-online   { color: #36ad6a; font-size: 1.2em; }\n",
 );
 
@@ -53,6 +52,9 @@ enum Reply {
     Status(Box<Status>),
     Failed { title: String, detail: String },
     Toast(String),
+    /// A setter that did not land. The widget is now showing a value the device
+    /// does not hold, so the main loop re-reads instead of leaving it lying.
+    Rejected(String),
 }
 
 fn describe(err: &Error) -> (String, String) {
@@ -96,23 +98,46 @@ fn spawn_worker(commands: mpsc::Receiver<Command>, replies: async_channel::Sende
                         Reply::Failed { title, detail }
                     }
                 },
-                Command::SetDpi(value) => confirm("DPI", device.set_dpi(value, None).map(|v| v as i64)),
-                Command::SetRate(value) => confirm(
-                    "Report rate",
-                    device.set_polling_rate(value).map(|v| format!("{v} Hz")),
-                ),
-                Command::SetLod(value) => confirm("Lift-off", device.set_lift_off(&value)),
-                Command::SetMotion(value) => confirm(
-                    "Motion Sync",
-                    device
-                        .set_motion_sync(value)
-                        .map(|on| if on { "on" } else { "off" }),
-                ),
-                Command::SetLightMode(mode) => {
-                    confirm("Light mode", device.set_light_mode(&mode))
-                }
-                Command::SetBrightness(value) => {
-                    confirm("Brightness", device.set_brightness(value))
+                setter => {
+                    let (label, outcome) = match setter {
+                        Command::SetDpi(value) => (
+                            "DPI",
+                            device.set_dpi(value, None).map(|v| (v as i64).to_string()),
+                        ),
+                        Command::SetRate(value) => (
+                            "Report rate",
+                            device.set_polling_rate(value).map(|v| format!("{v} Hz")),
+                        ),
+                        Command::SetLod(value) => {
+                            ("Lift-off", device.set_lift_off(&value).map(str::to_string))
+                        }
+                        Command::SetMotion(value) => (
+                            "Motion Sync",
+                            device
+                                .set_motion_sync(value)
+                                .map(|on| if on { "on" } else { "off" }.to_string()),
+                        ),
+                        Command::SetLightMode(mode) => (
+                            "Light mode",
+                            device.set_light_mode(&mode).map(str::to_string),
+                        ),
+                        Command::SetBrightness(value) => (
+                            "Brightness",
+                            device.set_brightness(value).map(|v| v.to_string()),
+                        ),
+                        Command::Refresh => unreachable!("handled above"),
+                    };
+                    match outcome {
+                        Ok(value) => Reply::Toast(format!("{label} → {value}")),
+                        Err(err) => {
+                            // A transport failure may also mean the receiver is
+                            // gone; drop the handle so the refresh re-opens it.
+                            if !matches!(err, Error::Unsupported(_)) {
+                                held = None;
+                            }
+                            Reply::Rejected(format!("{label} failed: {err}"))
+                        }
+                    }
                 }
             };
             if replies.send_blocking(reply).is_err() {
@@ -120,13 +145,6 @@ fn spawn_worker(commands: mpsc::Receiver<Command>, replies: async_channel::Sende
             }
         }
     });
-}
-
-fn confirm<T: std::fmt::Display>(label: &str, result: Result<T, Error>) -> Reply {
-    match result {
-        Ok(value) => Reply::Toast(format!("{label} → {value}")),
-        Err(err) => Reply::Toast(format!("{label} failed: {err}")),
-    }
 }
 
 /// Every widget the status refresh has to write into.
@@ -188,19 +206,34 @@ impl Ui {
             .set_subtitle(&format!("{link} · {}", status.path.display()));
         self.dot.set_visible(true);
 
-        let charging = status.charging.unwrap_or(false);
-        self.battery.set_label(&format!(
-            "{}%{}",
-            status.battery,
-            if charging { " ⚡" } else { "" }
-        ));
         self.battery.remove_css_class("battery-low");
         self.battery.remove_css_class("battery-good");
-        self.battery.add_css_class(if status.battery < 20 {
-            "battery-low"
+        match status.battery {
+            // No answer is not a flat battery, and must not be dressed as one.
+            None => self.battery.set_label("—"),
+            Some(percent) => {
+                let charging = status.charging.unwrap_or(false);
+                self.battery
+                    .set_label(&format!("{percent}%{}", if charging { " ⚡" } else { "" }));
+                self.battery.add_css_class(if percent < 20 {
+                    "battery-low"
+                } else {
+                    "battery-good"
+                });
+            }
+        }
+
+        // A Sora V3 takes 1-DPI steps and goes far past the Ten's ceiling. Set
+        // the range before the value, or the adjustment clamps the reading and
+        // the row shows a DPI the mouse does not hold.
+        let adjustment = self.dpi_row.adjustment();
+        let (step, upper) = if status.direct {
+            (1.0, f64::from(p::DPI_MAX_DIRECT))
         } else {
-            "battery-good"
-        });
+            (50.0, f64::from(p::DPI_MAX))
+        };
+        adjustment.set_upper(upper);
+        adjustment.set_step_increment(step);
 
         if let Some(dpi) = status.dpi {
             self.dpi_row.set_value(dpi);
@@ -210,9 +243,6 @@ impl Ui {
                 status.dpi_stages.len()
             ));
         }
-        // A Sora V3 takes 1-DPI steps; the TEN only multiples of 50.
-        let step = if status.direct { 1.0 } else { 50.0 };
-        self.dpi_row.adjustment().set_step_increment(step);
 
         if let Some(index) = p::POLLING_RATES.iter().position(|&r| r == status.polling_rate) {
             self.rate_toggles[index].set_active(true);
@@ -253,6 +283,44 @@ impl Ui {
         self.loading.set(false);
         self.stack.set_visible_child_name("device");
     }
+}
+
+/// How long a spin row must sit still before its value is written.
+///
+/// `value-changed` fires on every click, key repeat and scroll notch, and each
+/// write costs a round trip plus a confirming read of up to 750 ms. Sending them
+/// all would queue a dozen real flash writes for one flick of the wheel, take
+/// ten seconds to drain, and -- if the window is closed meanwhile -- leave the
+/// mouse on whatever intermediate value the drain had reached.
+const SPIN_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// Write a spin row's value once it stops moving, not once per step.
+fn on_spin_settled(
+    row: &adw::SpinRow,
+    ui: &Rc<Ui>,
+    make: impl Fn(f64) -> Command + 'static,
+) {
+    let pending: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+    let ui = Rc::clone(ui);
+    let make = Rc::new(make);
+    row.connect_value_notify(move |row| {
+        if ui.loading.get() {
+            return;
+        }
+        if let Some(timer) = pending.borrow_mut().take() {
+            timer.remove();
+        }
+        let value = row.value();
+        let ui = Rc::clone(&ui);
+        let make = Rc::clone(&make);
+        let armed = Rc::clone(&pending);
+        *pending.borrow_mut() = Some(gtk::glib::timeout_add_local_once(SPIN_SETTLE, move || {
+            // This source is firing; forget it so the next notify does not try
+            // to cancel an id that is already spent.
+            armed.borrow_mut().take();
+            ui.send(make(value));
+        }));
+    });
 }
 
 /// A row of linked toggle buttons acting as one exclusive choice.
@@ -443,13 +511,12 @@ fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
     *late.borrow_mut() = Some(Rc::clone(&ui));
 
     // Handlers that need the finished Ui ------------------------------------
-    let handler_ui = Rc::clone(&ui);
-    dpi_row.connect_value_notify(move |row| {
-        handler_ui.send(Command::SetDpi(row.value() as u32));
+    on_spin_settled(&dpi_row, &ui, |value| {
+        // Rounded, not truncated: a direct-mode reading can carry tenths.
+        Command::SetDpi(value.round() as u32)
     });
-    let handler_ui = Rc::clone(&ui);
-    bright_row.connect_value_notify(move |row| {
-        handler_ui.send(Command::SetBrightness(row.value() as u8));
+    on_spin_settled(&bright_row, &ui, |value| {
+        Command::SetBrightness(value.round() as u8)
     });
     let handler_ui = Rc::clone(&ui);
     motion_row.connect_active_notify(move |row| {
@@ -466,6 +533,10 @@ fn build_window(app: &adw::Application) -> adw::ApplicationWindow {
                 Reply::Status(status) => loop_ui.apply(&status),
                 Reply::Failed { title, detail } => loop_ui.show_error(&title, &detail),
                 Reply::Toast(text) => loop_ui.toast(&text),
+                Reply::Rejected(text) => {
+                    loop_ui.toast(&text);
+                    loop_ui.refresh();
+                }
             }
         }
     });

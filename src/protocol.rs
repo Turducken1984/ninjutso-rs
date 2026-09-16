@@ -128,8 +128,20 @@ pub fn control_payload(resume: bool) -> [u8; CONTROL_PAYLOAD_LEN] {
     payload
 }
 
+/// What the sensor accepts: multiples of 50 up to [`DPI_MAX`], or -- on a Sora
+/// V3, which takes 1-DPI steps -- anything up to [`DPI_MAX_DIRECT`]. The front
+/// ends bound their own inputs by these so they cannot offer an impossible DPI.
+pub const DPI_MIN: u32 = 50;
+pub const DPI_MAX: u32 = 30_000;
+pub const DPI_MIN_DIRECT: u32 = 1;
+pub const DPI_MAX_DIRECT: u32 = 45_000;
+
 pub fn encode_dpi(dpi: u32, direct: bool) -> Result<[u8; 3], Error> {
-    let (step, low, high) = if direct { (1, 1, 45_000) } else { (50, 50, 30_000) };
+    let (step, low, high) = if direct {
+        (1, DPI_MIN_DIRECT, DPI_MAX_DIRECT)
+    } else {
+        (50, DPI_MIN, DPI_MAX)
+    };
     if !(low..=high).contains(&dpi) || dpi % step != 0 {
         return Err(Error::Protocol(if direct {
             format!("DPI must be {low}-{high}")

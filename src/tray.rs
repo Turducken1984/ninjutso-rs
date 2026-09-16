@@ -4,13 +4,15 @@
 //! this talks the SNI + dbusmenu protocols itself. Plasma, Waybar, swaybar and
 //! GNOME's AppIndicator extension all host these.
 //!
-//! Deliberately passive: it registers, then sits idle. Nothing is read from the
-//! mouse until something asks -- opening the menu, clicking, or an explicit
-//! refresh. No timers are installed unless you pass `--poll`.
+//! The caller drives the reading; this module only serves the item and keeps it
+//! registered. Registration is re-sent whenever the host restarts, which is the
+//! only way a tray survives a plasmashell crash.
 
 use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use zbus::blocking::{connection, Connection};
 use zbus::interface;
@@ -20,6 +22,12 @@ pub const SNI_IFACE: &str = "org.kde.StatusNotifierItem";
 pub const WATCHER: &str = "org.kde.StatusNotifierWatcher";
 pub const ITEM_PATH: &str = "/StatusNotifierItem";
 pub const MENU_PATH: &str = "/MenuBar";
+const WATCHER_PATH: &str = "/StatusNotifierWatcher";
+
+/// Bound every outgoing call. zbus defaults to waiting forever, and the caller
+/// drives this from one thread: a notification daemon that accepts a call and
+/// never answers would otherwise wedge polling and menu handling with it.
+const METHOD_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// An ARGB32 icon: width, height, pixels in network byte order.
 pub type Pixmap = (i32, i32, Vec<u8>);
@@ -267,6 +275,24 @@ impl DbusMenu {
     }
 }
 
+/// Tell the watcher we exist. Cheap and idempotent, so re-sending it costs
+/// nothing and is the whole of the recovery mechanism.
+fn register_item(conn: &Connection) -> zbus::Result<()> {
+    let unique = conn
+        .inner()
+        .unique_name()
+        .map(|name| name.to_string())
+        .unwrap_or_default();
+    conn.call_method(
+        Some(WATCHER),
+        WATCHER_PATH,
+        Some(WATCHER),
+        "RegisterStatusNotifierItem",
+        &(unique,),
+    )?;
+    Ok(())
+}
+
 /// A registered tray item. Dropping it unregisters by closing the connection.
 pub struct Tray {
     conn: Connection,
@@ -276,8 +302,11 @@ pub struct Tray {
 impl Tray {
     /// Serve the SNI + dbusmenu objects and register with the host.
     ///
-    /// Fails when no StatusNotifier host is running, which is how a desktop
-    /// without a tray presents itself.
+    /// Takes `<app_id>.Tray` on the bus, so a second instance fails with
+    /// [`zbus::Error::NameTaken`] rather than putting a duplicate icon in the
+    /// tray. A missing StatusNotifier host is *not* an error: we register
+    /// anyway and re-register when one appears, which covers both the race
+    /// against the panel at login and the panel restarting later.
     pub fn register(
         app_id: &str,
         icon_name: &str,
@@ -298,24 +327,54 @@ impl Tray {
         };
 
         let conn = connection::Builder::session()?
+            .method_timeout(METHOD_TIMEOUT)
+            // DoNotQueue without ReplaceExisting: a second instance is told the
+            // name is taken instead of stealing it from the running one.
+            .replace_existing_names(false)
+            .allow_name_replacements(false)
+            .name(format!("{app_id}.Tray"))?
             .serve_at(ITEM_PATH, item)?
             .serve_at(MENU_PATH, menu)?
             .build()?;
 
-        let unique = conn
-            .inner()
-            .unique_name()
-            .map(|name| name.to_string())
-            .unwrap_or_default();
-        conn.call_method(
-            Some(WATCHER),
-            "/StatusNotifierWatcher",
-            Some(WATCHER),
-            "RegisterStatusNotifierItem",
-            &(unique,),
-        )?;
+        let tray = Self { conn, state };
+        // Not fatal: at login we often win the race against the panel.
+        let _ = tray.register_item();
+        tray.watch_for_host();
+        Ok(tray)
+    }
 
-        Ok(Self { conn, state })
+    fn register_item(&self) -> zbus::Result<()> {
+        register_item(&self.conn)
+    }
+
+    /// Re-register whenever the StatusNotifierWatcher name gains an owner.
+    ///
+    /// A panel restart wipes the watcher's item list, and nothing tells us:
+    /// without this the process keeps running, keeps polling and keeps emitting
+    /// signals into the void, with no icon and no way for the user to know.
+    fn watch_for_host(&self) {
+        let conn = self.conn.clone();
+        thread::spawn(move || {
+            let Ok(dbus) = zbus::blocking::fdo::DBusProxy::new(&conn) else {
+                return;
+            };
+            let Ok(changes) = dbus.receive_name_owner_changed_with_args(&[(0, WATCHER)]) else {
+                return;
+            };
+            for change in changes {
+                let Ok(args) = change.args() else { continue };
+                // An empty new owner is the watcher going away; wait for the
+                // one that brings it back.
+                if args.new_owner().is_none() {
+                    continue;
+                }
+                // The new host has no icon for us yet; this hands it one.
+                if register_item(&conn).is_ok() {
+                    let _ = conn.emit_signal(None::<&str>, ITEM_PATH, SNI_IFACE, "NewIcon", &());
+                }
+            }
+        });
     }
 
     fn emit(&self, signal: &str) {

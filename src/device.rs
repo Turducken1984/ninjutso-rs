@@ -143,7 +143,8 @@ pub struct Status {
     pub angle_tuning: bool,
     pub system_mode: Option<&'static str>,
     pub sleep_minutes: Option<u8>,
-    pub battery: u8,
+    /// `None` when the mouse did not answer -- distinct from a flat battery.
+    pub battery: Option<u8>,
     pub charging: Option<bool>,
     pub is_receiver: bool,
     /// (part, version), ordered mouse-then-receiver like the Python dict was.
@@ -374,7 +375,7 @@ impl Device {
 
         let battery = self
             .read_optional(cmd::BATTERY_PERCENT, &[])
-            .map_or(0, |value| value[0]);
+            .map(|value| value[0].min(100));
         let charging = self
             .read_optional(cmd::BATTERY_CHARGING, &[])
             .map(|value| value[0] != 0);
@@ -423,7 +424,7 @@ impl Device {
             sleep_minutes: self
                 .read_optional(cmd::SLEEP_MINUTES, &[])
                 .map(|value| value[0]),
-            battery: battery.min(100),
+            battery,
             charging,
             is_receiver: self.is_receiver(),
             firmware,

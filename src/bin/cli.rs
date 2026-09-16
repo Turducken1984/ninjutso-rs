@@ -113,11 +113,14 @@ fn cmd_status(device: &mut Device) -> Result<u8, Error> {
         s.product_id
     );
     let charge = match s.charging {
-        None => String::new(),
+        None => "charging status unavailable".to_string(),
         Some(true) => "charging".to_string(),
         Some(false) => "not charging".to_string(),
     };
-    println!("  Battery    {}%   {charge}", s.battery);
+    match s.battery {
+        Some(percent) => println!("  Battery    {percent}%   {charge}"),
+        None => println!("  Battery    no reading   {charge}"),
+    }
     let stages = s
         .dpi_stages
         .iter()

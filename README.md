@@ -27,6 +27,11 @@ Verified working against a **Ninjutso Ten** (receiver `093a:eb01`, paired mouse
 | Optical engine | ❌ Sora V3 only |
 | Firmware flashing | ❌ deliberately unimplemented — see below |
 
+The table is what the **CLI** covers, which is everything the protocol layer
+supports. The GUI is a subset: it edits the active DPI stage only, and does not
+yet expose lighting colour, lighting speed, or the online firmware check — use
+`ninjutso-cli` for those. The tray reads battery and charge only, by design.
+
 Sora V2 (legacy protocol) and Sora V3 paths are written but **untested** — I
 only own a Ten. Reports welcome.
 

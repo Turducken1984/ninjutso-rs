@@ -23,7 +23,16 @@ fn blend(dst: Rgb, src: Rgb, alpha: f64) -> Rgb {
     ]
 }
 
-pub fn level_color(percent: u8, charging: bool) -> Rgb {
+/// The unfilled part of the silhouette, and the whole of it when there is no
+/// reading at all.
+const TRACK: Rgb = [0x3A as f64, 0x41 as f64, 0x4A as f64];
+
+/// `None` means the mouse gave no answer -- drawn as the bare track, so a
+/// disconnected receiver never looks like a nearly flat battery.
+pub fn level_color(percent: Option<u8>, charging: bool) -> Rgb {
+    let Some(percent) = percent else {
+        return TRACK;
+    };
     if charging {
         return [0x4F as f64, 0xC3 as f64, 0xF7 as f64]; // blue while charging
     }
@@ -62,12 +71,12 @@ fn in_polygon(x: f64, y: f64, poly: &[(f64, f64)]) -> bool {
 ///
 /// Returns `(width, height, argb32)` in network byte order, which is exactly
 /// what the SNI IconPixmap property expects.
-pub fn battery_pixmap(percent: u8, charging: bool, size: i32) -> (i32, i32, Vec<u8>) {
+pub fn battery_pixmap(percent: Option<u8>, charging: bool, size: i32) -> (i32, i32, Vec<u8>) {
     battery_pixmap_sampled(percent, charging, size, 3)
 }
 
 fn battery_pixmap_sampled(
-    percent: u8,
+    percent: Option<u8>,
     charging: bool,
     size: i32,
     supersample: i32,
@@ -77,13 +86,14 @@ fn battery_pixmap_sampled(
     let (cx, cy) = (size_f / 2.0, size_f / 2.0);
     let (half_w, half_h) = (7.0 * scale, 10.5 * scale);
     let radius = 7.0 * scale;
-    let track: Rgb = [0x3A as f64, 0x41 as f64, 0x4A as f64];
+    let track: Rgb = TRACK;
     let fill = level_color(percent, charging);
     let edge: Rgb = [0x10 as f64, 0x13 as f64, 0x17 as f64];
 
-    // Fill line: bottom of the body up to `percent` of its height.
+    // Fill line: bottom of the body up to `percent` of its height. With no
+    // reading there is nothing to fill, so the body stays empty track.
     let (top, bottom) = (cy - half_h, cy + half_h);
-    let water = bottom - (bottom - top) * f64::from(percent.min(100)) / 100.0;
+    let water = bottom - (bottom - top) * f64::from(percent.unwrap_or(0).min(100)) / 100.0;
 
     let mut out = Vec::with_capacity((size * size * 4) as usize);
     let step = 1.0 / f64::from(supersample);
@@ -144,7 +154,7 @@ mod tests {
 
     #[test]
     fn pixmap_is_argb32_of_the_requested_size() {
-        let (w, h, data) = battery_pixmap(50, false, 22);
+        let (w, h, data) = battery_pixmap(Some(50), false, 22);
         assert_eq!((w, h), (22, 22));
         assert_eq!(data.len(), 22 * 22 * 4);
     }
@@ -152,7 +162,7 @@ mod tests {
     #[test]
     fn corners_are_transparent_and_the_centre_is_not() {
         let size = 24;
-        let (_, _, data) = battery_pixmap(100, false, size);
+        let (_, _, data) = battery_pixmap(Some(100), false, size);
         let at = |x: i32, y: i32| data[((y * size + x) * 4) as usize];
         assert_eq!(at(0, 0), 0, "top-left corner should be outside the silhouette");
         assert!(at(12, 12) > 200, "centre should be opaque");
@@ -160,10 +170,20 @@ mod tests {
 
     #[test]
     fn level_thresholds_match_the_documented_bands() {
-        assert_eq!(level_color(10, false), [0xE1 as f64, 0x06 as f64, 0x00 as f64]);
-        assert_eq!(level_color(25, false), [0xE8 as f64, 0xA3 as f64, 0x3D as f64]);
-        assert_eq!(level_color(80, false), [0x36 as f64, 0xAD as f64, 0x6A as f64]);
+        assert_eq!(level_color(Some(10), false), [0xE1 as f64, 0x06 as f64, 0x00 as f64]);
+        assert_eq!(level_color(Some(25), false), [0xE8 as f64, 0xA3 as f64, 0x3D as f64]);
+        assert_eq!(level_color(Some(80), false), [0x36 as f64, 0xAD as f64, 0x6A as f64]);
         // Charging wins over the level band.
-        assert_eq!(level_color(5, true), [0x4F as f64, 0xC3 as f64, 0xF7 as f64]);
+        assert_eq!(level_color(Some(5), true), [0x4F as f64, 0xC3 as f64, 0xF7 as f64]);
+    }
+
+    #[test]
+    fn no_reading_is_not_drawn_as_a_flat_battery() {
+        // A disconnected receiver must not look like 0%, which is red.
+        assert_eq!(level_color(None, false), TRACK);
+        assert_ne!(level_color(None, false), level_color(Some(0), false));
+        let (_, _, unknown) = battery_pixmap(None, false, 24);
+        let (_, _, flat) = battery_pixmap(Some(0), false, 24);
+        assert_ne!(unknown, flat);
     }
 }
