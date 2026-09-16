@@ -14,7 +14,7 @@ use zbus::zvariant::Value;
 
 use ninjutso::device::Device;
 use ninjutso::icons::battery_pixmap;
-use ninjutso::tray::{Action, MenuEntry, Tray};
+use ninjutso::tray::{self, Action, MenuEntry, Tray};
 
 const APP_ID: &str = "co.ninjutso.Configurator";
 const ICON_SIZES: [i32; 3] = [22, 32, 48];
@@ -23,14 +23,21 @@ const ICON_SIZES: [i32; 3] = [22, 32, 48];
 const THRESHOLDS: [u8; 3] = [20, 10, 5];
 const NOTIFY_IFACE: &str = "org.freedesktop.Notifications";
 
-const USAGE: &str = "usage: ninjutso-tray [--poll MINUTES] [--gui PATH]\n\
+const USAGE: &str = "usage: ninjutso-tray [--poll MINUTES] [--gui PATH] [--device PATH]\n\
     \n\
     \x20 --poll MINUTES  how often to read the battery (1-1440, default 10)\n\
-    \x20 --gui PATH      ninjutso-gui to launch from the menu";
+    \x20 --gui PATH      ninjutso-gui to launch from the menu\n\
+    \x20 --device PATH   hidraw node to use instead of the first one found";
 
+/// Give up and let the supervisor restart us after this many failed signals.
+/// One failure is a hiccup; three in a row is a session bus that has gone.
+const MAX_EMIT_FAILURES: u8 = 3;
+
+#[derive(Debug, PartialEq)]
 struct Args {
     poll_minutes: u64,
     gui_path: Option<PathBuf>,
+    device_path: Option<PathBuf>,
 }
 
 /// Parse argv, rejecting anything unrecognised.
@@ -41,6 +48,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     let mut parsed = Args {
         poll_minutes: 10,
         gui_path: None,
+        device_path: None,
     };
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -61,6 +69,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--gui" => {
                 let value = rest.next().ok_or("--gui needs a path")?;
                 parsed.gui_path = Some(PathBuf::from(value));
+            }
+            "--device" => {
+                let value = rest.next().ok_or("--device needs a path")?;
+                parsed.device_path = Some(PathBuf::from(value));
             }
             other => return Err(format!("unknown argument {other:?}")),
         }
@@ -107,6 +119,10 @@ struct BatteryTray {
     notify_id: u32,
     warned: HashSet<u8>,
     last_render: Option<(Option<u8>, Option<bool>)>,
+    device_path: Option<PathBuf>,
+    /// What the mouse calls itself, once we have managed to read it.
+    name: String,
+    emit_failures: u8,
     /// Launched GUIs, kept only so they can be reaped. Dropping a `Child`
     /// does not wait, and GApplication uniqueness means every launch after the
     /// first exits within milliseconds -- one zombie per click, otherwise.
@@ -114,7 +130,7 @@ struct BatteryTray {
 }
 
 impl BatteryTray {
-    fn new(poll_minutes: u64, gui_path: Option<PathBuf>, actions: Sender<Action>) -> zbus::Result<Self> {
+    fn new(args: Args, actions: Sender<Action>) -> zbus::Result<Self> {
         let items = vec![
             MenuEntry::item(1, "Open Ninjutso", Action::OpenGui),
             MenuEntry::separator(2),
@@ -124,11 +140,14 @@ impl BatteryTray {
         ];
         Ok(Self {
             tray: Tray::register(APP_ID, APP_ID, items, actions)?,
-            poll: Duration::from_secs(poll_minutes.clamp(1, 1440) * 60),
-            gui_path,
+            poll: Duration::from_secs(args.poll_minutes.clamp(1, 1440) * 60),
+            gui_path: args.gui_path,
             notify_id: 0,
             warned: HashSet::new(),
             last_render: None,
+            device_path: args.device_path,
+            name: "Ninjutso".to_string(),
+            emit_failures: 0,
             children: Vec::new(),
         })
     }
@@ -161,13 +180,21 @@ impl BatteryTray {
     // -- polling -------------------------------------------------------------
 
     fn poll_device(&mut self) {
-        let Ok(device) = Device::open() else {
-            self.render(None, None, "Ninjutso — receiver not connected");
+        let opened = match &self.device_path {
+            Some(path) => Device::open_path(path.clone()),
+            None => Device::open(),
+        };
+        let Ok(device) = opened else {
+            let tooltip = format!("{} — receiver not connected", self.name);
+            self.render(None, None, &tooltip);
             return;
         };
+        // Whatever it calls itself beats the generic name in every message.
+        self.name = device.name.replace("Ninjutso Inc. ", "Ninjutso ");
         let (percent, charging) = device.battery();
         let Some(level) = percent else {
-            self.render(None, charging, "Ninjutso — no battery reading");
+            let tooltip = format!("{} — no battery reading", self.name);
+            self.render(None, charging, &tooltip);
             return;
         };
 
@@ -176,28 +203,46 @@ impl BatteryTray {
             Some(false) => "battery",
             None => "battery, charging status unavailable",
         };
-        self.render(
-            percent,
-            charging,
-            &format!("Ninjutso\n{level}% {state}"),
-        );
-        if let Some(threshold) = warn_threshold(&mut self.warned, level, charging) {
-            self.notify(level, threshold);
+        let tooltip = format!("{}\n{level}% {state}", self.name);
+        self.render(percent, charging, &tooltip);
+        match warn_threshold(&mut self.warned, level, charging) {
+            Some(threshold) => self.notify(level, threshold),
+            // Back on the charger, or recovered: a "battery low" sitting in the
+            // notification centre is no longer true, so take it down.
+            None if self.warned.is_empty() => self.clear_notification(),
+            None => {}
         }
     }
 
     fn render(&mut self, percent: Option<u8>, charging: Option<bool>, tooltip: &str) {
         let key = render_key(percent, charging);
+        let mut sent = Ok(());
         if self.last_render != Some(key) {
             self.last_render = Some(key);
-            self.tray.set_pixmaps(
+            sent = self.tray.set_pixmaps(
                 ICON_SIZES
                     .iter()
                     .map(|&size| battery_pixmap(percent, charging == Some(true), size))
                     .collect(),
             );
         }
-        self.tray.set_tooltip(tooltip);
+        let sent = sent.and_then(|()| self.tray.set_tooltip(tooltip));
+        // A signal that will not send means the bus is gone, and an invisible
+        // tray that keeps waking the radio every ten minutes helps nobody.
+        match sent {
+            Ok(()) => self.emit_failures = 0,
+            Err(err) => {
+                self.emit_failures += 1;
+                eprintln!("tray update failed: {err}");
+            }
+        }
+    }
+
+    fn clear_notification(&mut self) {
+        if self.notify_id != 0 {
+            let _ = self.tray.close_notification(self.notify_id);
+            self.notify_id = 0;
+        }
     }
 
     // -- notifications -------------------------------------------------------
@@ -210,7 +255,7 @@ impl BatteryTray {
         ]
         .into_iter()
         .collect::<std::collections::HashMap<_, _>>();
-        let body = format!("Your Ninjutso mouse is at {percent}%. Plug it in to keep using it.");
+        let body = format!("Your {} is at {percent}%. Plug it in to keep using it.", self.name);
 
         let reply = self.tray.connection().call_method(
             Some(NOTIFY_IFACE),
@@ -240,6 +285,10 @@ impl BatteryTray {
         self.poll_device();
         loop {
             self.reap();
+            if self.emit_failures >= MAX_EMIT_FAILURES {
+                eprintln!("error: lost the session bus, exiting");
+                return 1;
+            }
             match actions.recv_timeout(self.poll) {
                 Ok(Action::Quit) => return 0,
                 Ok(Action::OpenGui) => self.open_gui(),
@@ -266,7 +315,8 @@ fn main() -> ExitCode {
     };
 
     let (sender, receiver) = mpsc::channel();
-    let mut tray = match BatteryTray::new(args.poll_minutes, args.gui_path, sender) {
+    tray::wake_on_resume(sender.clone());
+    let mut tray = match BatteryTray::new(args, sender) {
         Ok(tray) => tray,
         Err(zbus::Error::NameTaken) => {
             eprintln!("a Ninjutso tray is already running");
@@ -301,12 +351,21 @@ mod tests {
     }
 
     #[test]
-    fn gui_path_is_optional() {
-        assert_eq!(parse_args(&args(&[])).unwrap().gui_path, None);
-        assert_eq!(
-            parse_args(&args(&["--gui", "/usr/bin/x"])).unwrap().gui_path,
-            Some(PathBuf::from("/usr/bin/x"))
-        );
+    fn paths_are_optional_and_independent() {
+        let bare = parse_args(&args(&[])).unwrap();
+        assert_eq!(bare.gui_path, None);
+        assert_eq!(bare.device_path, None);
+
+        let both = parse_args(&args(&[
+            "--gui",
+            "/usr/bin/x",
+            "--device",
+            "/dev/hidraw7",
+        ]))
+        .unwrap();
+        assert_eq!(both.gui_path, Some(PathBuf::from("/usr/bin/x")));
+        assert_eq!(both.device_path, Some(PathBuf::from("/dev/hidraw7")));
+        assert!(parse_args(&args(&["--device"])).is_err());
     }
 
     #[test]

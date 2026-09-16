@@ -29,8 +29,8 @@ Verified working against a **Ninjutso Ten** (receiver `093a:eb01`, paired mouse
 
 The table is what the **CLI** covers, which is everything the protocol layer
 supports. The GUI is a subset: it edits the active DPI stage only, and does not
-yet expose lighting colour, lighting speed, or the online firmware check — use
-`ninjutso-cli` for those. The tray reads battery and charge only, by design.
+yet expose lighting speed or the online firmware check — use `ninjutso-cli` for
+those. The tray reads battery and charge only, by design.
 
 Sora V2 (legacy protocol) and Sora V3 paths are written but **untested** — I
 only own a Ten. Reports welcome.
@@ -42,9 +42,10 @@ cargo build --release                              # all three binaries
 cargo build --release --no-default-features        # CLI only, no system deps
 ```
 
-The CLI needs nothing but a Rust toolchain. The GUI needs `gtk4-devel` and
-`libadwaita-devel` (`gtk4` + `libadwaita` feature `gui`); the tray is pure Rust
-over D-Bus (feature `tray`). Both are on by default.
+The CLI needs nothing but a Rust toolchain. The GUI needs `gtk4-devel` 4.10 or
+newer and `libadwaita-devel` (`gtk4` + `libadwaita` feature `gui`) — 4.10 for
+the colour picker's `GtkColorDialogButton`; the tray is pure Rust over D-Bus
+(feature `tray`). Both are on by default.
 
 ```sh
 sudo dnf install cargo rust gtk4-devel libadwaita-devel   # Fedora
@@ -90,6 +91,11 @@ ninjutso-gui                   # GTK4 app
 ninjutso-tray --poll 10        # battery in the system tray
 ```
 
+All three take `--device /dev/hidrawN` to pick a node when more than one
+Ninjutso device is attached. `ninjutso-tray` also takes `--gui <path>`; both
+`--help` on anything they do not understand rather than starting up with a
+silently ignored flag.
+
 Every setter writes, re-reads, and reports what the device actually confirmed.
 Nothing claims success on a blind write.
 
@@ -126,9 +132,34 @@ and cannot share a process with GTK4. Tray icons are ARGB32 bitmaps rasterised
 from a signed-distance field in plain Rust, so the battery level is exact and
 never touches the icon theme cache.
 
+**The tray survives the desktop restarting.** It re-registers with the
+StatusNotifier watcher whenever that name gains an owner, so a plasmashell
+crash or a panel reload brings the icon back by itself. A missing watcher at
+login is not fatal either — it waits for one rather than exiting. The tray
+holds `co.ninjutso.Configurator.Tray` on the bus, so a second copy refuses to
+start instead of adding a duplicate icon.
+
+**Nothing is ever shown as a value it did not read.** An unanswered battery is
+"no reading", not 0%; an unknown charge state says so rather than claiming
+"not charging"; and a failed write re-reads the device instead of leaving the
+widget showing what you asked for. The tray draws "no reading" as a bare grey
+silhouette, distinct from the red of a genuinely flat battery.
+
 **Battery polling is deliberately cheap.** `Device::battery` is two round-trips
 (~60 ms), not `status`'s twenty-one (~644 ms), because each read wakes the
 2.4 GHz link. At the 10-minute default that is 8.6 s of radio time per day.
+The timer runs on `CLOCK_MONOTONIC`, which does not advance across a suspend,
+so the tray also listens for logind's `PrepareForSleep` and polls on resume
+rather than showing a nine-hour-old reading.
+
+**The protocol layer is testable without a mouse.** `Device` talks through a
+`Transport` trait; `Hidraw` is the real one and a scripted fake stands in for
+tests, holding device state keyed by command and applying writes through the
+same setter/getter pairing the hardware implements. Everything above the trait
+— encoding, read-back confirmation, timeout classification, all of `status()` —
+runs unchanged against it, so `cargo test` covers the Sora V3 DPI range, the
+sleeping-mouse-versus-dead-receiver distinction and every setter round trip on
+hardware the author does not own.
 
 **No firmware writing, ever.** These tools report versions and stop there.
 Flashing is Windows-only from the vendor, and a half-written dongle is a brick.
@@ -151,7 +182,8 @@ The command exits non-zero only when an update is genuinely available.
 
 ```
 src/protocol.rs     command table, encoders, packet builder
-src/device.rs       hidraw discovery + ioctl transport
+src/transport.rs    the Transport trait, hidraw ioctl, test fake
+src/device.rs       device discovery and the command layer
 src/app.rs          GTK4 / libadwaita GUI
 src/tray.rs         StatusNotifierItem + dbusmenu over D-Bus
 src/icons.rs        ARGB32 icon rasteriser
@@ -175,6 +207,12 @@ Behaviour is intended to match; these are the deliberate divergences.
   instead of falling back to `0`.
 - **The tray takes `--gui <path>`** to override where it looks for the GUI
   binary, which the Python version inferred from its own location only.
+- **Spin rows write once they settle**, not once per step. `value-changed`
+  fires per click, key repeat and scroll notch, and each write costs a round
+  trip plus a confirming read — the Python version sent them all, so a flick of
+  the wheel over the DPI row wrote every value it passed through to flash.
+- **The tray reaps the GUIs it launches** and bounds its D-Bus calls, both of
+  which matter only after days of uptime, which is how the tray is meant to run.
 
 ## Credit
 

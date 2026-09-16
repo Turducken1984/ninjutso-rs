@@ -95,6 +95,26 @@ fn item_props(label: Option<&str>) -> HashMap<String, OwnedValue> {
     props
 }
 
+/// Keep only the properties the caller asked for; an empty list means all of
+/// them, which is what the dbusmenu spec says and what Plasma relies on.
+fn selected(
+    mut props: HashMap<String, OwnedValue>,
+    wanted: &[String],
+) -> HashMap<String, OwnedValue> {
+    if !wanted.is_empty() {
+        props.retain(|name, _| wanted.contains(name));
+    }
+    props
+}
+
+/// The root node's own properties. It is a menu, not an item, so it carries
+/// only the hint that it has children.
+fn root_props() -> HashMap<String, OwnedValue> {
+    let mut props = HashMap::new();
+    props.insert("children-display".to_string(), owned("submenu"));
+    props
+}
+
 /// A dbusmenu node: id, properties, children.
 type MenuNode = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
 
@@ -188,16 +208,12 @@ struct DbusMenu {
 }
 
 impl DbusMenu {
-    fn children(&self) -> Vec<OwnedValue> {
+    fn children(&self, property_names: &[String]) -> Vec<OwnedValue> {
         self.items
             .iter()
             .map(|entry| {
-                let child: Structure = node(
-                    entry.id,
-                    item_props(entry.label.as_deref()),
-                    Vec::new(),
-                )
-                .into();
+                let props = selected(item_props(entry.label.as_deref()), property_names);
+                let child: Structure = node(entry.id, props, Vec::new()).into();
                 owned(child)
             })
             .collect()
@@ -206,34 +222,73 @@ impl DbusMenu {
 
 #[interface(name = "com.canonical.dbusmenu")]
 impl DbusMenu {
+    /// The menu is flat: the root has every item as a child and no item has
+    /// children of its own. `recursion_depth` of 0 means properties only.
     fn get_layout(
         &self,
-        _parent_id: i32,
-        _recursion_depth: i32,
-        _property_names: Vec<String>,
-    ) -> (u32, MenuNode) {
-        let mut root_props = HashMap::new();
-        root_props.insert("children-display".to_string(), owned("submenu"));
-        (self.revision, node(0, root_props, self.children()))
+        parent_id: i32,
+        recursion_depth: i32,
+        property_names: Vec<String>,
+    ) -> zbus::fdo::Result<(u32, MenuNode)> {
+        if parent_id == 0 {
+            let children = if recursion_depth == 0 {
+                Vec::new()
+            } else {
+                self.children(&property_names)
+            };
+            return Ok((self.revision, node(0, root_props(), children)));
+        }
+        let entry = self
+            .items
+            .iter()
+            .find(|entry| entry.id == parent_id)
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no menu item {parent_id}")))?;
+        let props = selected(item_props(entry.label.as_deref()), &property_names);
+        Ok((self.revision, node(entry.id, props, Vec::new())))
     }
 
+    /// An empty `ids` means every node -- including the root, which a host may
+    /// ask about by id 0.
     fn get_group_properties(
         &self,
-        _ids: Vec<i32>,
-        _property_names: Vec<String>,
+        ids: Vec<i32>,
+        property_names: Vec<String>,
     ) -> Vec<(i32, HashMap<String, OwnedValue>)> {
-        self.items
-            .iter()
-            .map(|entry| (entry.id, item_props(entry.label.as_deref())))
-            .collect()
+        let wanted = |id: i32| ids.is_empty() || ids.contains(&id);
+        let mut out = Vec::with_capacity(self.items.len() + 1);
+        if wanted(0) {
+            out.push((0, selected(root_props(), &property_names)));
+        }
+        out.extend(
+            self.items
+                .iter()
+                .filter(|entry| wanted(entry.id))
+                .map(|entry| {
+                    (
+                        entry.id,
+                        selected(item_props(entry.label.as_deref()), &property_names),
+                    )
+                }),
+        );
+        out
     }
 
-    fn get_property(&self, id: i32, name: String) -> OwnedValue {
-        self.items
-            .iter()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| item_props(entry.label.as_deref()).remove(&name))
-            .unwrap_or_else(|| owned(""))
+    fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedValue> {
+        let props = if id == 0 {
+            root_props()
+        } else {
+            let entry = self
+                .items
+                .iter()
+                .find(|entry| entry.id == id)
+                .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no menu item {id}")))?;
+            item_props(entry.label.as_deref())
+        };
+        props
+            .into_iter()
+            .find(|(key, _)| *key == name)
+            .map(|(_, value)| value)
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no property {name}")))
     }
 
     fn event(&self, id: i32, event_id: String, _data: Value<'_>, _timestamp: u32) {
@@ -273,6 +328,41 @@ impl DbusMenu {
     fn icon_theme_path(&self) -> Vec<String> {
         Vec::new()
     }
+}
+
+/// Ask for a poll as soon as the machine wakes from suspend.
+///
+/// The caller's poll timer runs on `CLOCK_MONOTONIC`, which does not advance
+/// while suspended: after a nine-hour laptop sleep the tray would otherwise go
+/// on showing the pre-suspend battery level for up to another full interval.
+/// logind announces the resume on the system bus, and a poll is one round trip.
+///
+/// Silently does nothing where there is no logind or no system bus -- this is a
+/// refinement on the timer, never the only thing driving it.
+pub fn wake_on_resume(actions: Sender<Action>) {
+    thread::spawn(move || {
+        let Ok(system) = Connection::system() else {
+            return;
+        };
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface("org.freedesktop.login1.Manager")
+            .and_then(|builder| builder.member("PrepareForSleep"));
+        let Ok(rule) = rule else { return };
+        let Ok(signals) =
+            zbus::blocking::MessageIterator::for_match_rule(rule.build(), &system, None)
+        else {
+            return;
+        };
+        for message in signals.flatten() {
+            // True is "about to suspend", false is "just resumed".
+            if message.body().deserialize::<bool>() == Ok(false)
+                && actions.send(Action::Refresh).is_err()
+            {
+                return; // the tray has quit
+            }
+        }
+    });
 }
 
 /// Tell the watcher we exist. Cheap and idempotent, so re-sending it costs
@@ -377,21 +467,40 @@ impl Tray {
         });
     }
 
-    fn emit(&self, signal: &str) {
-        let _ = self
-            .conn
-            .emit_signal(None::<&str>, ITEM_PATH, SNI_IFACE, signal, &());
+    /// Signalling failure is how a session bus that has gone away presents;
+    /// the caller counts these rather than living on invisibly.
+    fn emit(&self, signal: &str) -> zbus::Result<()> {
+        self.conn
+            .emit_signal(None::<&str>, ITEM_PATH, SNI_IFACE, signal, &())
     }
 
-    pub fn set_tooltip(&self, text: &str) {
-        self.state.lock().unwrap().tooltip = text.to_string();
-        self.emit("NewToolTip");
+    pub fn set_tooltip(&self, text: &str) -> zbus::Result<()> {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.tooltip == text {
+                return Ok(()); // nothing to tell the host
+            }
+            state.tooltip = text.to_string();
+        }
+        self.emit("NewToolTip")
     }
 
     /// Replace the icon with generated ARGB32 bitmaps and tell the host.
-    pub fn set_pixmaps(&self, pixmaps: Vec<Pixmap>) {
+    pub fn set_pixmaps(&self, pixmaps: Vec<Pixmap>) -> zbus::Result<()> {
         self.state.lock().unwrap().pixmaps = pixmaps;
-        self.emit("NewIcon");
+        self.emit("NewIcon")
+    }
+
+    /// Withdraw a notification that no longer describes the situation.
+    pub fn close_notification(&self, id: u32) -> zbus::Result<()> {
+        self.conn.call_method(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            Some("org.freedesktop.Notifications"),
+            "CloseNotification",
+            &(id,),
+        )?;
+        Ok(())
     }
 
     pub fn connection(&self) -> &Connection {
@@ -402,6 +511,69 @@ impl Tray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn menu() -> DbusMenu {
+        let (actions, _rx) = std::sync::mpsc::channel();
+        DbusMenu {
+            items: vec![
+                MenuEntry::item(1, "Open Ninjutso", Action::OpenGui),
+                MenuEntry::separator(2),
+                MenuEntry::item(3, "Quit", Action::Quit),
+            ],
+            revision: 1,
+            actions,
+        }
+    }
+
+    #[test]
+    fn the_root_layout_carries_every_item() {
+        let (_revision, (id, props, children)) = menu().get_layout(0, -1, Vec::new()).unwrap();
+        assert_eq!(id, 0);
+        assert_eq!(props["children-display"], owned("submenu"));
+        assert_eq!(children.len(), 3);
+    }
+
+    #[test]
+    fn a_layout_request_is_answered_for_what_was_asked_for() {
+        let menu = menu();
+        // Depth 0 is "this node's properties, no children".
+        let (_, (_, _, children)) = menu.get_layout(0, 0, Vec::new()).unwrap();
+        assert!(children.is_empty());
+
+        // A subtree request gets that item, not the root relabelled.
+        let (_, (id, props, children)) = menu.get_layout(3, -1, Vec::new()).unwrap();
+        assert_eq!(id, 3);
+        assert_eq!(props["label"], owned("Quit".to_string()));
+        assert!(children.is_empty());
+
+        assert!(menu.get_layout(99, -1, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn property_requests_are_filtered_as_asked() {
+        let menu = menu();
+        let wanted = vec!["label".to_string()];
+        let (_, (_, _, children)) = menu.get_layout(0, -1, wanted.clone()).unwrap();
+        assert_eq!(children.len(), 3);
+
+        let groups = menu.get_group_properties(vec![1], wanted);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].0, 1);
+        assert_eq!(groups[0].1.len(), 1, "only the property that was asked for");
+
+        // No ids means everything, including the root.
+        let all = menu.get_group_properties(Vec::new(), Vec::new());
+        assert_eq!(all.len(), 4);
+        assert_eq!(all[0].0, 0);
+    }
+
+    #[test]
+    fn an_unknown_property_is_an_error_not_an_empty_string() {
+        let menu = menu();
+        assert_eq!(menu.get_property(1, "label".into()).unwrap(), owned("Open Ninjutso".to_string()));
+        assert!(menu.get_property(1, "nonesuch".into()).is_err());
+        assert!(menu.get_property(99, "label".into()).is_err());
+    }
 
     #[test]
     fn separators_and_items_carry_different_properties() {

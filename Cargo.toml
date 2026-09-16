@@ -25,8 +25,8 @@ ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-gtk4 = { version = "0.9", optional = true }
-libadwaita = { version = "0.7", features = ["v1_5"], optional = true }
+gtk4 = { version = "0.9", features = ["v4_10"], optional = true }
+libadwaita = { version = "0.7", features = ["v1_6"], optional = true }
 async-channel = { version = "2", optional = true }
 zbus = { version = "5", optional = true }
 

@@ -2,16 +2,20 @@
 
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crate::protocol::{self as p, cmd};
+use crate::transport::{Hidraw, Transport};
 use crate::{Error, Result};
 
 const FIRST_READ_DELAY: Duration = Duration::from_millis(30);
 const RETRY_READ_DELAY: Duration = Duration::from_millis(60);
+/// How long the device needs to apply a write before the read-back is worth
+/// sending. Measured on a Ten.
+const WRITE_SETTLE: Duration = Duration::from_millis(30);
 
 /// How long a required read keeps asking before giving up.
 ///
@@ -26,19 +30,37 @@ const RETRY_READ_DELAY: Duration = Duration::from_millis(60);
 /// soon as the device answers.
 const READ_BUDGET: Duration = Duration::from_millis(750);
 
-// _IOC(dir = READ|WRITE, type = 'H', nr, size)
-const IOC_RW: u32 = 3;
-
-const fn ioc(nr: u32, size: u32) -> libc::c_ulong {
-    ((IOC_RW << 30) | (size << 16) | ((b'H' as u32) << 8) | nr) as libc::c_ulong
+/// Waits between a request and the read that answers it.
+///
+/// Real against hardware; zeroed against a fake, where the answer is already
+/// there and a timeout path would otherwise burn the whole [`READ_BUDGET`] in
+/// wall-clock time for every test that exercises it.
+#[derive(Debug, Clone, Copy)]
+struct Pacing {
+    first_read: Duration,
+    retry_read: Duration,
+    budget: Duration,
+    after_write: Duration,
 }
 
-const fn hidiocsfeature(size: u32) -> libc::c_ulong {
-    ioc(0x06, size)
-}
+impl Pacing {
+    const HARDWARE: Self = Self {
+        first_read: FIRST_READ_DELAY,
+        retry_read: RETRY_READ_DELAY,
+        budget: READ_BUDGET,
+        after_write: WRITE_SETTLE,
+    };
 
-const fn hidiocgfeature(size: u32) -> libc::c_ulong {
-    ioc(0x07, size)
+    #[cfg(test)]
+    const INSTANT: Self = Self {
+        first_read: Duration::ZERO,
+        retry_read: Duration::ZERO,
+        // One attempt, then give up: a fake either knows the answer or never
+        // will, so retrying it only spins. A read that succeeds returns before
+        // the deadline is ever consulted.
+        budget: Duration::ZERO,
+        after_write: Duration::ZERO,
+    };
 }
 
 /// The config channel is the vendor collection declaring report 6:
@@ -162,12 +184,13 @@ pub struct Lighting {
 
 /// One open Ninjutso config interface.
 pub struct Device {
-    fd: OwnedFd,
+    io: Box<dyn Transport>,
     pub path: PathBuf,
     pub product_id: u16,
     pub name: String,
     profile: u8,
     effective_pid: Option<u16>,
+    pacing: Pacing,
 }
 
 impl Device {
@@ -211,41 +234,28 @@ impl Device {
             Err(err) => return Err(err.into()),
         };
         Ok(Self {
-            fd,
+            io: Box::new(Hidraw::new(fd)),
             path: node.path,
             product_id: node.product_id,
             name: node.name,
             profile: 1,
             effective_pid: None,
+            pacing: Pacing::HARDWARE,
         })
     }
 
-    // -- raw feature reports -------------------------------------------------
-
-    fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<()> {
-        let mut buf = Vec::with_capacity(payload.len() + 1);
-        buf.push(report_id);
-        buf.extend_from_slice(payload);
-        let request = hidiocsfeature(buf.len() as u32);
-        // SAFETY: `buf` is a live allocation of exactly the length encoded in
-        // the ioctl request, which is what HIDIOCSFEATURE reads.
-        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), request, buf.as_mut_ptr()) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error().into());
+    /// A device backed by a scripted transport, with the hardware waits removed.
+    #[cfg(test)]
+    fn fake(io: impl Transport + 'static, product_id: u16) -> Self {
+        Self {
+            io: Box::new(io),
+            path: PathBuf::from("/dev/hidraw-fake"),
+            product_id,
+            name: "Ninjutso Inc. Ten".to_string(),
+            profile: 1,
+            effective_pid: None,
+            pacing: Pacing::INSTANT,
         }
-        Ok(())
-    }
-
-    fn get_feature(&self, report_id: u8, length: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; length + 1];
-        buf[0] = report_id;
-        let request = hidiocgfeature(buf.len() as u32);
-        // SAFETY: as above; HIDIOCGFEATURE writes at most `buf.len()` bytes.
-        let rc = unsafe { libc::ioctl(self.fd.as_raw_fd(), request, buf.as_mut_ptr()) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        Ok(buf)
     }
 
     // -- protocol ------------------------------------------------------------
@@ -256,8 +266,8 @@ impl Device {
     /// asked too soon, so each attempt re-sends and re-reads until the reply's
     /// command byte matches.
     pub fn read(&self, command: u8, args: &[u8]) -> Result<Vec<u8>> {
-        let deadline = Instant::now() + READ_BUDGET;
-        let mut delay = FIRST_READ_DELAY;
+        let deadline = Instant::now() + self.pacing.budget;
+        let mut delay = self.pacing.first_read;
         loop {
             if let Some(value) = self.attempt(command, args, delay)? {
                 return Ok(value);
@@ -265,7 +275,7 @@ impl Device {
             if Instant::now() >= deadline {
                 return Err(self.link_failure(command));
             }
-            delay = RETRY_READ_DELAY;
+            delay = self.pacing.retry_read;
         }
     }
 
@@ -283,7 +293,7 @@ impl Device {
         if command == cmd::ONLINE || !self.is_receiver() {
             return Error::Timeout(command);
         }
-        match self.attempt(cmd::ONLINE, &[], FIRST_READ_DELAY) {
+        match self.attempt(cmd::ONLINE, &[], self.pacing.first_read) {
             Ok(Some(value)) if value[0] == 0 => Error::Offline,
             _ => Error::Timeout(command),
         }
@@ -297,9 +307,9 @@ impl Device {
             0
         };
         let request = p::build_request(command, profile, args)?;
-        self.set_feature(p::REPORT_ID, &request)?;
+        self.io.set_feature(p::REPORT_ID, &request)?;
         sleep(delay);
-        let buf = self.get_feature(p::REPORT_ID, p::PAYLOAD_LEN)?;
+        let buf = self.io.get_feature(p::REPORT_ID, p::PAYLOAD_LEN)?;
         Ok(p::response_value(&buf, command).map(<[u8]>::to_vec))
     }
 
@@ -309,17 +319,19 @@ impl Device {
     /// command presents, so retrying only slows detection. Never use this to
     /// confirm a write -- see [`READ_BUDGET`].
     pub fn read_optional(&self, command: u8, args: &[u8]) -> Option<Vec<u8>> {
-        self.attempt(command, args, FIRST_READ_DELAY).ok().flatten()
+        self.attempt(command, args, self.pacing.first_read)
+            .ok()
+            .flatten()
     }
 
     pub fn write(&self, command: u8, args: &[u8]) -> Result<()> {
         let request = p::build_request(command, self.profile, args)?;
-        self.set_feature(p::REPORT_ID, &request)
+        self.io.set_feature(p::REPORT_ID, &request)
     }
 
     pub fn set_control(&self, resume: bool) -> Result<()> {
-        self.set_feature(p::CONTROL_REPORT_ID, &p::control_payload(resume))?;
-        sleep(Duration::from_millis(30));
+        self.io.set_feature(p::CONTROL_REPORT_ID, &p::control_payload(resume))?;
+        sleep(self.pacing.after_write);
         Ok(())
     }
 
@@ -490,14 +502,14 @@ impl Device {
         let mut args = vec![stage as u8];
         args.extend_from_slice(&p::encode_dpi(dpi, direct)?);
         self.write(cmd::SET_DPI, &args)?;
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         let value = self.read(cmd::DPI, &[stage as u8])?;
         Ok(p::decode_dpi(value[0], value[1], value[2], direct))
     }
 
     pub fn set_polling_rate(&mut self, rate: u32) -> Result<u32> {
         self.write(cmd::SET_POLLING_RATE, &[p::encode_polling(rate)?])?;
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         Ok(p::decode_polling(self.read(cmd::POLLING_RATE, &[])?[0]))
     }
 
@@ -507,7 +519,7 @@ impl Device {
             .position(|&v| v == value)
             .ok_or_else(|| Error::Protocol(format!("unknown lift-off distance {value}")))?;
         self.write(cmd::SET_LIFT_OFF, &[index as u8])?;
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         let read_back = self.read(cmd::LIFT_OFF, &[])?[0] as usize;
         p::LOD_VALUES
             .get(read_back)
@@ -517,7 +529,7 @@ impl Device {
 
     pub fn set_motion_sync(&mut self, enabled: bool) -> Result<bool> {
         self.write(cmd::SET_MOTION_SYNC, &[enabled as u8])?;
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         Ok(self.read(cmd::MOTION_SYNC, &[])?[0] != 0)
     }
 
@@ -559,7 +571,7 @@ impl Device {
             ));
         }
         self.write(cmd::SET_LIGHTING_BRIGHTNESS, &[percent / 25])?;
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         Ok(self.confirmed(cmd::LIGHTING_BRIGHTNESS)?[0].saturating_mul(25))
     }
 
@@ -574,13 +586,13 @@ impl Device {
             self.write(cmd::SET_LIGHTING_STATE, &[1])?;
             self.write(cmd::SET_LIGHTING_MODE, &[index as u8 + 1])?;
         }
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         self.confirmed_light_mode()
     }
 
     pub fn set_color(&mut self, hex_colour: &str) -> Result<String> {
         self.write(cmd::SET_LIGHTING_COLOR, &p::hex_to_rgb(hex_colour)?)?;
-        sleep(Duration::from_millis(30));
+        sleep(self.pacing.after_write);
         let value = self.confirmed(cmd::LIGHTING_COLOR)?;
         Ok(p::rgb_to_hex(value[0], value[1], value[2]))
     }
@@ -590,12 +602,131 @@ impl Device {
 mod tests {
     use super::*;
 
+    use std::sync::Arc;
+
+    use crate::transport::Fake;
+
+    /// A Ten behind its receiver, which is what the author actually owns. The
+    /// fake comes back too, so a test can see what was put on the wire.
+    fn ten() -> (Device, Arc<Fake>) {
+        wired(Fake::ten(), p::TEN_RECEIVER_IDS[0])
+    }
+
+    fn sora_v3() -> (Device, Arc<Fake>) {
+        wired(Fake::sora_v3(), p::SORA_V3_IDS[1])
+    }
+
+    fn wired(fake: Fake, product_id: u16) -> (Device, Arc<Fake>) {
+        let fake = Arc::new(fake);
+        (Device::fake(Arc::clone(&fake), product_id), fake)
+    }
+
     #[test]
-    fn ioctl_requests_match_the_kernel_definitions() {
-        // HIDIOCSFEATURE(16) / HIDIOCGFEATURE(16) as the hidraw uapi header
-        // spells them: _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06|0x07, len).
-        assert_eq!(hidiocsfeature(16), 0xC010_4806);
-        assert_eq!(hidiocgfeature(16), 0xC010_4807);
+    fn status_reads_a_whole_device_in_one_pass() {
+        let status = ten().0.status().unwrap();
+        assert_eq!(status.dpi, Some(1600.0));
+        assert_eq!(status.dpi_stages.len(), 4);
+        assert_eq!(status.polling_rate, 1000);
+        assert_eq!(status.lift_off, Some("Medium"));
+        assert!(status.motion_sync);
+        assert_eq!(status.battery, Some(73));
+        assert_eq!(status.charging, Some(false));
+        assert!(!status.direct);
+        assert_eq!(status.effective_product_id, 0xE020);
+        // Mouse and receiver both answer the firmware command.
+        assert_eq!(status.firmware.len(), 2);
+        let light = status.lighting.expect("the receiver has lighting");
+        assert_eq!(light.mode, "Static");
+        assert_eq!(light.color.as_deref(), Some("#36ad6a"));
+        // The Ten does not implement the brightness command.
+        assert_eq!(light.brightness, None);
+    }
+
+    #[test]
+    fn a_dpi_write_round_trips_through_the_encoding() {
+        let (mut device, fake) = ten();
+        assert_eq!(device.set_dpi(3200, Some(0)).unwrap(), 3200.0);
+        // 3200/50 - 1 = 63, little-endian, on stage 0.
+        assert_eq!(fake.wrote(cmd::SET_DPI), Some(vec![0, 63, 0, 0]));
+        assert_eq!(device.status().unwrap().dpi, Some(3200.0));
+    }
+
+    #[test]
+    fn a_sora_v3_keeps_a_dpi_the_ten_could_not_hold() {
+        // The regression this guards: 36000 is above the stepped ceiling of
+        // 30000, so anything that clamps to the Ten's range corrupts it.
+        let (mut device, _fake) = sora_v3();
+        let status = device.status().unwrap();
+        assert!(status.direct);
+        assert_eq!(status.dpi, Some(36000.0));
+        assert_eq!(device.set_dpi(45000, Some(0)).unwrap(), 45000.0);
+    }
+
+    #[test]
+    fn dpi_outside_the_device_range_is_refused_before_it_is_written() {
+        let (mut device, fake) = ten();
+        assert!(device.set_dpi(45000, Some(0)).is_err());
+        assert!(device.set_dpi(1601, Some(0)).is_err(), "not a multiple of 50");
+        assert_eq!(fake.wrote(cmd::SET_DPI), None, "nothing was sent");
+    }
+
+    #[test]
+    fn a_sleeping_mouse_reports_as_asleep_not_as_a_timeout() {
+        let fake = Fake::ten();
+        // The receiver still answers ONLINE -- with 0, meaning the mouse is
+        // off the air -- while the mouse's own commands go unanswered.
+        fake.set(cmd::ONLINE, 0, &[0]).silence(cmd::DPI);
+        let (mut device, _fake) = wired(fake, p::TEN_RECEIVER_IDS[0]);
+        assert!(matches!(device.status(), Err(Error::Offline)));
+    }
+
+    #[test]
+    fn a_receiver_that_stops_answering_is_a_timeout_not_a_sleeping_mouse() {
+        let fake = Fake::ten();
+        fake.silence(cmd::ONLINE).silence(cmd::DPI);
+        let (mut device, _fake) = wired(fake, p::TEN_RECEIVER_IDS[0]);
+        assert!(matches!(device.status(), Err(Error::Timeout(cmd::DPI))));
+    }
+
+    #[test]
+    fn an_unanswered_battery_is_none_rather_than_zero() {
+        let fake = Fake::ten();
+        fake.silence(cmd::BATTERY_PERCENT);
+        let status = wired(fake, p::TEN_RECEIVER_IDS[0]).0.status().unwrap();
+        // Reported as "no reading"; drawing it as a flat battery would be a lie.
+        assert_eq!(status.battery, None);
+    }
+
+    #[test]
+    fn brightness_is_refused_on_hardware_that_has_no_such_command() {
+        assert!(matches!(
+            ten().0.set_brightness(50),
+            Err(Error::Unsupported(_))
+        ));
+        // A Sora V3 answers command 48, so the same call lands there.
+        assert_eq!(sora_v3().0.set_brightness(75).unwrap(), 75);
+    }
+
+    #[test]
+    fn lighting_writes_confirm_by_reading_back() {
+        let (mut device, fake) = ten();
+        assert_eq!(device.set_color("#ff8800").unwrap(), "#ff8800");
+        assert_eq!(device.set_light_mode("Wave").unwrap(), "Wave");
+        assert_eq!(device.set_light_mode("Off").unwrap(), "Off");
+        // Off is the lighting *state*, so the mode is left alone underneath.
+        assert_eq!(fake.wrote(cmd::SET_LIGHTING_STATE), Some(vec![0]));
+    }
+
+    #[test]
+    fn the_other_setters_round_trip() {
+        let (mut device, _fake) = ten();
+        assert_eq!(device.set_polling_rate(4000).unwrap(), 4000);
+        assert_eq!(device.set_lift_off("High").unwrap(), "High");
+        assert!(!device.set_motion_sync(false).unwrap());
+        let status = device.status().unwrap();
+        assert_eq!(status.polling_rate, 4000);
+        assert_eq!(status.lift_off, Some("High"));
+        assert!(!status.motion_sync);
     }
 
     #[test]
