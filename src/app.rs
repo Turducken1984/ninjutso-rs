@@ -684,6 +684,18 @@ fn build_window(app: &adw::Application, device_path: Option<PathBuf>) -> adw::Ap
         }
     });
 
+    // Somebody outside the widget graph has to own the Ui: it holds the
+    // widgets, and their handlers point back at it, so every handle inside the
+    // graph is deliberately Weak. The window owns it and lets go on close,
+    // which drops the command sender, ends the worker, and so ends the reply
+    // loop above. Without this the Ui dies the moment this function returns
+    // and the window sits on "Looking for your mouse..." for ever.
+    let owner = RefCell::new(Some(Rc::clone(&ui)));
+    window.connect_close_request(move |_| {
+        owner.borrow_mut().take();
+        gtk::glib::Propagation::Proceed
+    });
+
     ui.refresh();
     window
 }
