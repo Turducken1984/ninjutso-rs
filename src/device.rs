@@ -4,8 +4,7 @@ use std::fs;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::protocol::{self as p, cmd};
 use crate::transport::{Hidraw, Transport};
@@ -29,39 +28,6 @@ const WRITE_SETTLE: Duration = Duration::from_millis(30);
 /// the number re-tuned. It only bounds failure: a read that succeeds returns as
 /// soon as the device answers.
 const READ_BUDGET: Duration = Duration::from_millis(750);
-
-/// Waits between a request and the read that answers it.
-///
-/// Real against hardware; zeroed against a fake, where the answer is already
-/// there and a timeout path would otherwise burn the whole [`READ_BUDGET`] in
-/// wall-clock time for every test that exercises it.
-#[derive(Debug, Clone, Copy)]
-struct Pacing {
-    first_read: Duration,
-    retry_read: Duration,
-    budget: Duration,
-    after_write: Duration,
-}
-
-impl Pacing {
-    const HARDWARE: Self = Self {
-        first_read: FIRST_READ_DELAY,
-        retry_read: RETRY_READ_DELAY,
-        budget: READ_BUDGET,
-        after_write: WRITE_SETTLE,
-    };
-
-    #[cfg(test)]
-    const INSTANT: Self = Self {
-        first_read: Duration::ZERO,
-        retry_read: Duration::ZERO,
-        // One attempt, then give up: a fake either knows the answer or never
-        // will, so retrying it only spins. A read that succeeds returns before
-        // the deadline is ever consulted.
-        budget: Duration::ZERO,
-        after_write: Duration::ZERO,
-    };
-}
 
 /// The config channel is the vendor collection declaring report 6:
 /// `06 01 ff  09 01  a1 01  85 06`
@@ -190,7 +156,6 @@ pub struct Device {
     pub name: String,
     profile: u8,
     effective_pid: Option<u16>,
-    pacing: Pacing,
 }
 
 impl Device {
@@ -240,11 +205,11 @@ impl Device {
             name: node.name,
             profile: 1,
             effective_pid: None,
-            pacing: Pacing::HARDWARE,
         })
     }
 
-    /// A device backed by a scripted transport, with the hardware waits removed.
+    /// A device backed by a scripted transport, which runs a virtual clock, so
+    /// the retry budget is spent as it would be on hardware but costs nothing.
     #[cfg(test)]
     fn fake(io: impl Transport + 'static, product_id: u16) -> Self {
         Self {
@@ -254,7 +219,6 @@ impl Device {
             name: "Ninjutso Inc. Ten".to_string(),
             profile: 1,
             effective_pid: None,
-            pacing: Pacing::INSTANT,
         }
     }
 
@@ -266,16 +230,18 @@ impl Device {
     /// asked too soon, so each attempt re-sends and re-reads until the reply's
     /// command byte matches.
     pub fn read(&self, command: u8, args: &[u8]) -> Result<Vec<u8>> {
-        let deadline = Instant::now() + self.pacing.budget;
-        let mut delay = self.pacing.first_read;
+        // The clock comes from the transport, so a fake spends this budget
+        // exactly as the hardware would but in no wall-clock time at all.
+        let deadline = self.io.now() + READ_BUDGET;
+        let mut delay = FIRST_READ_DELAY;
         loop {
             if let Some(value) = self.attempt(command, args, delay)? {
                 return Ok(value);
             }
-            if Instant::now() >= deadline {
+            if self.io.now() >= deadline {
                 return Err(self.link_failure(command));
             }
-            delay = self.pacing.retry_read;
+            delay = RETRY_READ_DELAY;
         }
     }
 
@@ -293,7 +259,7 @@ impl Device {
         if command == cmd::ONLINE || !self.is_receiver() {
             return Error::Timeout(command);
         }
-        match self.attempt(cmd::ONLINE, &[], self.pacing.first_read) {
+        match self.attempt(cmd::ONLINE, &[], FIRST_READ_DELAY) {
             Ok(Some(value)) if value[0] == 0 => Error::Offline,
             _ => Error::Timeout(command),
         }
@@ -308,7 +274,7 @@ impl Device {
         };
         let request = p::build_request(command, profile, args)?;
         self.io.set_feature(p::REPORT_ID, &request)?;
-        sleep(delay);
+        self.io.sleep(delay);
         let buf = self.io.get_feature(p::REPORT_ID, p::PAYLOAD_LEN)?;
         Ok(p::response_value(&buf, command).map(<[u8]>::to_vec))
     }
@@ -319,9 +285,7 @@ impl Device {
     /// command presents, so retrying only slows detection. Never use this to
     /// confirm a write -- see [`READ_BUDGET`].
     pub fn read_optional(&self, command: u8, args: &[u8]) -> Option<Vec<u8>> {
-        self.attempt(command, args, self.pacing.first_read)
-            .ok()
-            .flatten()
+        self.attempt(command, args, FIRST_READ_DELAY).ok().flatten()
     }
 
     pub fn write(&self, command: u8, args: &[u8]) -> Result<()> {
@@ -331,7 +295,7 @@ impl Device {
 
     pub fn set_control(&self, resume: bool) -> Result<()> {
         self.io.set_feature(p::CONTROL_REPORT_ID, &p::control_payload(resume))?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         Ok(())
     }
 
@@ -502,14 +466,14 @@ impl Device {
         let mut args = vec![stage as u8];
         args.extend_from_slice(&p::encode_dpi(dpi, direct)?);
         self.write(cmd::SET_DPI, &args)?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         let value = self.read(cmd::DPI, &[stage as u8])?;
         Ok(p::decode_dpi(value[0], value[1], value[2], direct))
     }
 
     pub fn set_polling_rate(&mut self, rate: u32) -> Result<u32> {
         self.write(cmd::SET_POLLING_RATE, &[p::encode_polling(rate)?])?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         Ok(p::decode_polling(self.read(cmd::POLLING_RATE, &[])?[0]))
     }
 
@@ -519,7 +483,7 @@ impl Device {
             .position(|&v| v == value)
             .ok_or_else(|| Error::Protocol(format!("unknown lift-off distance {value}")))?;
         self.write(cmd::SET_LIFT_OFF, &[index as u8])?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         let read_back = self.read(cmd::LIFT_OFF, &[])?[0] as usize;
         p::LOD_VALUES
             .get(read_back)
@@ -529,7 +493,7 @@ impl Device {
 
     pub fn set_motion_sync(&mut self, enabled: bool) -> Result<bool> {
         self.write(cmd::SET_MOTION_SYNC, &[enabled as u8])?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         Ok(self.read(cmd::MOTION_SYNC, &[])?[0] != 0)
     }
 
@@ -571,7 +535,7 @@ impl Device {
             ));
         }
         self.write(cmd::SET_LIGHTING_BRIGHTNESS, &[percent / 25])?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         Ok(self.confirmed(cmd::LIGHTING_BRIGHTNESS)?[0].saturating_mul(25))
     }
 
@@ -586,13 +550,13 @@ impl Device {
             self.write(cmd::SET_LIGHTING_STATE, &[1])?;
             self.write(cmd::SET_LIGHTING_MODE, &[index as u8 + 1])?;
         }
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         self.confirmed_light_mode()
     }
 
     pub fn set_color(&mut self, hex_colour: &str) -> Result<String> {
         self.write(cmd::SET_LIGHTING_COLOR, &p::hex_to_rgb(hex_colour)?)?;
-        sleep(self.pacing.after_write);
+        self.io.sleep(WRITE_SETTLE);
         let value = self.confirmed(cmd::LIGHTING_COLOR)?;
         Ok(p::rgb_to_hex(value[0], value[1], value[2]))
     }
@@ -686,6 +650,27 @@ mod tests {
         fake.silence(cmd::ONLINE).silence(cmd::DPI);
         let (mut device, _fake) = wired(fake, p::TEN_RECEIVER_IDS[0]);
         assert!(matches!(device.status(), Err(Error::Timeout(cmd::DPI))));
+    }
+
+    #[test]
+    fn a_required_read_spends_its_whole_budget_before_giving_up() {
+        let fake = Fake::ten();
+        fake.silence(cmd::MOTION_SYNC);
+        let (device, clock) = wired(fake, p::TEN_RECEIVER_IDS[0]);
+
+        assert!(device.read(cmd::MOTION_SYNC, &[]).is_err());
+
+        // Virtual time, so this costs nothing to run but still pins the
+        // behaviour: the read keeps asking for the full budget. A fixed
+        // attempt count -- what this used to be -- gave up after ~200 ms and
+        // so could never confirm a rate change, reporting a write that had
+        // landed as a failure.
+        let spent = clock.elapsed();
+        assert!(spent >= READ_BUDGET, "gave up after only {spent:?}");
+        // And stops once it is gone: the budget, plus one last attempt, plus
+        // the single ONLINE probe that classifies the failure.
+        let ceiling = READ_BUDGET + RETRY_READ_DELAY + FIRST_READ_DELAY;
+        assert!(spent <= ceiling, "ran {spent:?} over a {ceiling:?} ceiling");
     }
 
     #[test]

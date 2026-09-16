@@ -8,6 +8,7 @@
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::time::{Duration, Instant};
 
 use crate::Result;
 
@@ -21,6 +22,19 @@ pub trait Transport: Send {
     /// Read the report the device prepared for the last request
     /// (`HIDIOCGFEATURE`). The returned buffer leads with the report ID.
     fn get_feature(&self, report_id: u8, length: usize) -> Result<Vec<u8>>;
+
+    /// Wait for the device to catch up.
+    ///
+    /// Time is part of the seam so a fake can run a virtual clock: the retry
+    /// budget is then spent exactly as it would be on hardware, in no
+    /// wall-clock time at all, and a test can assert on how much of it went.
+    fn sleep(&self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
 }
 
 // _IOC(dir = READ|WRITE, type = 'H', nr, size)
@@ -98,10 +112,28 @@ mod tests {
 mod fake {
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
+    use std::time::{Duration, Instant};
 
     use super::Transport;
     use crate::protocol::{self as p, cmd};
     use crate::{Error, Result};
+
+    /// Virtual time, as (origin, now). Starts the first time it is consulted,
+    /// so a fake that is never asked about time never reads the real clock.
+    type Clock = Option<(Instant, Instant)>;
+
+    trait Started {
+        fn started(&mut self) -> &mut (Instant, Instant);
+    }
+
+    impl Started for Clock {
+        fn started(&mut self) -> &mut (Instant, Instant) {
+            self.get_or_insert_with(|| {
+                let origin = Instant::now();
+                (origin, origin)
+            })
+        }
+    }
 
     /// How a setter's arguments land in the state a getter reads back.
     enum Shape {
@@ -144,6 +176,8 @@ mod fake {
         silent: Mutex<HashSet<u8>>,
         pending: Mutex<Option<(u8, u8)>>,
         pub writes: Mutex<Vec<(u8, Vec<u8>)>>,
+        /// Advanced only by the code under test asking to wait.
+        clock: Mutex<Clock>,
     }
 
     impl Fake {
@@ -204,6 +238,14 @@ mod fake {
             self
         }
 
+        /// How much time the code under test believes has passed.
+        pub fn elapsed(&self) -> Duration {
+            self.clock
+                .lock()
+                .unwrap()
+                .map_or(Duration::ZERO, |(start, now)| now - start)
+        }
+
         pub fn wrote(&self, command: u8) -> Option<Vec<u8>> {
             self.writes
                 .lock()
@@ -224,9 +266,24 @@ mod fake {
         fn get_feature(&self, report_id: u8, length: usize) -> Result<Vec<u8>> {
             (**self).get_feature(report_id, length)
         }
+        fn sleep(&self, duration: Duration) {
+            (**self).sleep(duration);
+        }
+        fn now(&self) -> Instant {
+            (**self).now()
+        }
     }
 
     impl Transport for Fake {
+        /// Advance the virtual clock instead of actually waiting.
+        fn sleep(&self, duration: Duration) {
+            self.clock.lock().unwrap().started().1 += duration;
+        }
+
+        fn now(&self) -> Instant {
+            self.clock.lock().unwrap().started().1
+        }
+
         fn set_feature(&self, report_id: u8, payload: &[u8]) -> Result<()> {
             if report_id == p::CONTROL_REPORT_ID {
                 return Ok(());

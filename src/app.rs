@@ -690,10 +690,13 @@ fn build_window(app: &adw::Application, device_path: Option<PathBuf>) -> adw::Ap
     // which drops the command sender, ends the worker, and so ends the reply
     // loop above. Without this the Ui dies the moment this function returns
     // and the window sits on "Looking for your mouse..." for ever.
+    //
+    // `destroy` rather than `close-request`: close-request is only emitted when
+    // the user closes the window, so quitting the application or calling
+    // `destroy()` would skip it and leak the lot.
     let owner = RefCell::new(Some(Rc::clone(&ui)));
-    window.connect_close_request(move |_| {
+    window.connect_destroy(move |_| {
         owner.borrow_mut().take();
-        gtk::glib::Propagation::Proceed
     });
 
     ui.refresh();
