@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Managed by ClaudeInConcert (template/githooks/pre-commit); `concert sync` overwrites edits.
+# Blocks commits that contain secrets. Findings are redacted, never printed.
+if ! command -v gitleaks >/dev/null; then
+  echo "pre-commit: gitleaks is not installed, so this commit is blocked." >&2
+  echo "Install it with: pkexec dnf install -y gitleaks" >&2
+  exit 1
+fi
+exec gitleaks git --pre-commit --staged --redact --no-banner --verbose

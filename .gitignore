@@ -2,3 +2,12 @@
 
 # Vendor firmware installers are proprietary and must not be redistributed.
 *.exe
+# >>> concert
+.env
+.env.*
+.envrc
+!env.example
+*.pem
+*.key
+secrets/
+# <<< concert
